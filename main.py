@@ -94,47 +94,84 @@ def deduplicate(items: list[dict]) -> list[dict]:
 # ---------- 行情快照 ----------
 
 def fetch_quote(symbol: dict) -> dict | None:
-    """从东方财富获取单个标的的实时报价。"""
+    """获取实时报价：优先东方财富，失败时回退 Yahoo Finance。"""
+    # ---------- 源 1：东方财富 ----------
     try:
         url = "https://push2.eastmoney.com/api/qt/stock/get"
-        params = {"secid": symbol["eastmoney_id"], "fields": "f43,f60,f170"}
-        r = requests.get(url, params=params, timeout=10)
+        params = {
+            "secid": symbol["eastmoney_id"],
+            "fields": "f43,f60,f170",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 东方财富公共令牌
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json().get("data")
-        if not data:
+        if data:
+            latest_raw = data.get("f43")
+            prev_raw = data.get("f60")
+            pct_raw = data.get("f170")
+            if latest_raw is not None and prev_raw is not None:
+                pct = float(pct_raw) / 100 if pct_raw is not None else None
+                price = None
+                for scale in (100, 1000, 1):
+                    p = float(latest_raw) / scale
+                    prev = float(prev_raw) / scale
+                    if prev == 0 or not (0.01 < p < 100000):
+                        continue
+                    implied = (p - prev) / prev * 100
+                    if pct is None or abs(implied - pct) < 1.5:
+                        price = p
+                        break
+                if price is None:
+                    price = float(latest_raw) / 100
+                return {
+                    "name": symbol["name"],
+                    "price": round(price, symbol["decimals"]),
+                    "change_pct": round(pct, 2) if pct is not None else 0.0,
+                    "unit": symbol["unit"],
+                }
+    except Exception as exc:
+        print(f"[东方财富失败] {symbol['name']}: {exc}")
+
+    # ---------- 源 2：Yahoo Finance 备用 ----------
+    yahoo_map = {
+        "brent": "BZ=F",
+        "gold": "GC=F",
+        "dxy": "DX-Y.NYB",
+    }
+    yahoo_ticker = yahoo_map.get(symbol["key"])
+    if not yahoo_ticker:
+        return None
+    try:
+        y_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
+        y_params = {"interval": "1m", "range": "1d"}
+        y_headers = {"User-Agent": "Mozilla/5.0"}
+        yr = requests.get(y_url, params=y_params, headers=y_headers, timeout=10)
+        yr.raise_for_status()
+        ydata = yr.json()
+        result = ydata.get("chart", {}).get("result")
+        if not result:
+            print(f"[Yahoo备用失败] {symbol['name']}: 无结果")
             return None
-
-        latest_raw = data.get("f43")
-        prev_raw = data.get("f60")
-        pct_raw = data.get("f170")
-        if latest_raw is None or prev_raw is None:
+        meta = result[0].get("meta", {})
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        if price is None or prev is None or prev == 0:
+            print(f"[Yahoo备用失败] {symbol['name']}: 价格字段缺失")
             return None
-
-        pct = float(pct_raw) / 100 if pct_raw is not None else None
-
-        # 东方财富不同品种的缩放比例不同，用涨跌幅验证哪个缩放合理
-        price = None
-        for scale in (100, 1000, 1):
-            p = float(latest_raw) / scale
-            prev = float(prev_raw) / scale
-            if prev == 0 or not (0.01 < p < 100000):
-                continue
-            implied = (p - prev) / prev * 100
-            if pct is None or abs(implied - pct) < 1.5:
-                price = p
-                break
-
-        if price is None:
-            price = float(latest_raw) / 100  # 兜底：外盘期货默认 /100
-
+        pct = (price - prev) / prev * 100
         return {
             "name": symbol["name"],
             "price": round(price, symbol["decimals"]),
-            "change_pct": round(pct, 2) if pct is not None else 0.0,
+            "change_pct": round(pct, 2),
             "unit": symbol["unit"],
         }
     except Exception as exc:
-        print(f"[行情失败] {symbol['name']}: {exc}")
+        print(f"[Yahoo备用失败] {symbol['name']}: {exc}")
         return None
 
 
@@ -183,7 +220,6 @@ def build_market_card(snapshot: list[dict]) -> str:
         )
     cards_html = "".join(rows)
 
-    # 基于阈值的简短异动判断（确定性规则，不依赖 AI）
     notes = []
     brent = next((q for q in snapshot if q["name"] == "布伦特原油"), None)
     gold = next((q for q in snapshot if q["name"] == "伦敦金"), None)
