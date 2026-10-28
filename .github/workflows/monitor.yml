@@ -1,0 +1,28 @@
+name: Geopolitical & Oil Monitor
+
+on:
+  schedule:
+    # UTC 时间，每 3 小时一次（北京时间 0,3,6,9,12,15,18,21 点）
+    - cron: "0 */3 * * *"
+  workflow_dispatch:  # 支持手动触发测试
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python main.py
