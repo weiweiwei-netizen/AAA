@@ -3,7 +3,7 @@ name: Geopolitical & Oil Monitor
 on:
   schedule:
     # UTC 时间，每 3 小时一次（北京时间 0,3,6,9,12,15,18,21 点）
-    - cron: "0 */3 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:
 
 jobs:
