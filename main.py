@@ -49,7 +49,6 @@ def format_time(ts: float | None) -> str:
     """将 UTC 时间戳转换为北京时间 (UTC+8) 的 MM-DD HH:MM 格式"""
     if not ts:
         return "未知时间"
-    # GitHub Actions 跑在 UTC 时区，这里 +8 小时转为北京时间
     dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(hours=8)
     return dt.strftime("%m-%d %H:%M")
 
@@ -304,7 +303,7 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 ## 一、内容要求
 
 **核心事实（3~5 条）**
-只列出对“美伊冲突/霍尔木兹通行/原油供应/美联储政策/特朗普政策”有实质影响的事实，每条一句话。
+只列出对“美伊冲突/霍尔木兹通行/原油供应/美联储政策/特朗普政策”有实质影响的事实，每条独立成行。
 
 **地缘与供应研判（2~3 句）**
 判断当前局势是在升级、僵持还是缓和，以及对霍尔木兹航运的实际威胁程度。
@@ -316,34 +315,42 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 聚焦利率路径、官员表态、流动性预期。若本时段无实质新信息，明确写“本时段无实质新信息”。
 
 **特朗普动态（2~3 句）**
-总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。
+总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。多条动作请独立成行。
 
 **需要盯住的下一个变量（1~2 条）**
 列出即将发生或可能触发的关键事件/时间节点。
 
 语气：冷静、事实导向，不渲染恐慌，不使用“战争一触即发”等标题党措辞。
 
-## 二、时间标注要求（必须严格遵守）
+## 二、列表与排版符号要求（必须严格遵守）
 
-1. 简报中列出的每一条核心事实、每一个特朗普动态，**必须**在其末尾附带该消息的发布时间。
-2. 时间格式统一为 `MM-DD HH:MM`（注意：上面提供的时间已经是北京时间，直接用即可）。
-3. 时间必须使用指定的 HTML 小字样式跟在文字后面：`<span style="font-size:12px;color:#888;background:#f0f1f3;padding:2px 6px;border-radius:4px;margin-left:6px;">10-28 14:30</span>`。
-4. 如果某条研判综合了多个时间点的信息，请标注核心事件的时间。
-5. 行情数据区块不需要加新闻时间。
+1. 在“核心事实”板块，以及“特朗普动态”板块中，如果列出了多条事实或动作，**每一条必须独立成行**，且**不能**使用原生的 `<ul>`、`<li>`、`-` 或 `•`。
+2. 每一条事实或动作的开头，**必须**强制使用下面这段确切的 HTML 代码（直接复制这段代码作为前缀，只修改背景色）：
+   `<span style="display:inline-block;width:6px;height:6px;border-radius:2px;margin-right:8px;vertical-align:middle;background:#e74c3c;"></span>`
+3. 方块颜色自适应：
+   - 升级/中断/鹰派/强硬表态：将上方代码的 background 改为 `#e74c3c`（红色）
+   - 僵持/中性/常规动作：将上方代码的 background 改为 `#f39c12`（琥珀色）
+   - 缓和/次要消息：将上方代码的 background 改为 `#95a5a6`（灰色）
 
-## 三、HTML 硬性约束
+## 三、时间标注要求
+
+1. 简报中列出的每一条核心事实、每一个特朗普动态，**必须**在结尾附带发布时间。
+2. 时间格式统一为 `MM-DD HH:MM`（直接使用提供的时间）。
+3. 必须使用下方指定的 HTML 小字样式跟在文字后面：`<span style="font-size:12px;color:#888;background:#f0f1f3;padding:2px 6px;border-radius:4px;margin-left:6px;">10-28 14:30</span>`。
+
+## 四、HTML 硬性约束
 
 1. 只输出 HTML 片段本体，不要 ```html 代码块标记，不要任何解释性文字。
 2. 所有样式必须内联。禁止 <script>、<style> 标签、外部 CSS、外部字体、class 选择器。
 3. 禁止 flex、grid、position: fixed/sticky、transform 等布局属性。
 4. 整封简报外层用 <div style="font-family:-apple-system,'PingFang SC',sans-serif;font-size:14px;color:#333;line-height:1.6;"> 包裹。
 
-## 四、视觉规范
+## 五、视觉规范
 
 - 每个内容区块一个卡片：背景 #f7f8fa，圆角 12px，padding 14px 16px，margin-bottom 12px。
 - 区块标题：14px 加粗，#1a1a1a，左侧 3px 竖条强调色。
 - 正文：14px，#333，行高 1.6。
-- 强调色：升级/供应中断/鹰派/涉伊强硬表态 → #e74c3c；僵持/中性/常规政策 → #f39c12；缓和/无新信息 → #95a5a6。
+- 强调色：升级/中断/鹰派/涉伊强硬 → #e74c3c；僵持/中性/常规 → #f39c12；缓和/无新信息 → #95a5a6。
 - 区块顺序固定：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ **特朗普动态** ⑥ 下一个变量。
 - 美联储或特朗普若“无新信息/无言论”，收窄为浅灰单行提示。
 
@@ -383,8 +390,10 @@ def build_fallback_html(items: list[dict], market_card: str) -> str:
         cat_map = {"geo": "地缘/原油", "fed": "美联储", "trump": "特朗普动态"}
         cat = cat_map.get(it["category"], "其他")
         pub_time = format_time(it["published"])
+        # 降级模式下也强制加上小方块符号
         rows.append(
             '<div style="padding:8px 0;border-bottom:1px solid #eee;">'
+            '<span style="display:inline-block;width:6px;height:6px;background:#e74c3c;border-radius:2px;margin-right:8px;vertical-align:middle;"></span>'
             f'<span style="font-size:12px;color:#888;">[{html.escape(cat)}]</span> '
             f'<span style="font-size:14px;color:#333;">{html.escape(it["title"])}</span>'
             f'<span style="font-size:11px;color:#999;margin-left:8px;">({pub_time})</span>'
