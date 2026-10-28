@@ -2,8 +2,8 @@ name: Geopolitical & Oil Monitor
 
 on:
   schedule:
-    # 测试用：每 5 分钟触发一次（注意：GitHub 免费版有延迟，可能不会刚好卡在 5 分钟）
-    - cron: "*/5 * * * *"
+    # 每 2 小时的 15 分触发（UTC时间），对应北京时间 0:15, 2:15, 4:15...
+    - cron: "15 */2 * * *"
   workflow_dispatch:  # 支持手动触发
 
 jobs:
