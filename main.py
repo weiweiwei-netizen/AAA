@@ -35,7 +35,8 @@ FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
 TRUMP_RSS = "https://www.trumpstruth.org/feed"
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
-HOURS_LOOKBACK = 6
+# 🌟 关键修改：因为现在2小时推一次，所以只抓过去 2.5 小时的新闻，避免大量重复
+HOURS_LOOKBACK = 2.5
 
 MARKET_SYMBOLS = [
     {"key": "brent", "name": "布伦特原油", "eastmoney_id": "112.B00Y", "unit": "美元/桶", "decimals": 2},
@@ -50,6 +51,12 @@ def format_time(ts: float | None) -> str:
     if not ts:
         return "未知时间"
     dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(hours=8)
+    return dt.strftime("%m-%d %H:%M")
+
+
+def get_beijing_time_now() -> str:
+    """获取当前的北京时间字符串"""
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     return dt.strftime("%m-%d %H:%M")
 
 
@@ -109,7 +116,6 @@ def deduplicate(items: list[dict]) -> list[dict]:
 # ---------- 行情快照 ----------
 
 def fetch_quote(symbol: dict) -> dict | None:
-    """获取实时报价：优先东方财富，失败时回退 Yahoo Finance。"""
     try:
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {
@@ -390,7 +396,6 @@ def build_fallback_html(items: list[dict], market_card: str) -> str:
         cat_map = {"geo": "地缘/原油", "fed": "美联储", "trump": "特朗普动态"}
         cat = cat_map.get(it["category"], "其他")
         pub_time = format_time(it["published"])
-        # 降级模式下也强制加上小方块符号
         rows.append(
             '<div style="padding:8px 0;border-bottom:1px solid #eee;">'
             '<span style="display:inline-block;width:6px;height:6px;background:#e74c3c;border-radius:2px;margin-right:8px;vertical-align:middle;"></span>'
@@ -436,7 +441,7 @@ def main():
         print("过去数小时没有抓到新内容，仅推送行情快照。")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        push_to_wechat(f"📊 行情速览 · {time.strftime('%m-%d %H:%M')}", market_card)
+        push_to_wechat(f"📊 行情速览 · {get_beijing_time_now()}", market_card)
         return
 
     hormuz_json = fetch_hormuz_status()
@@ -455,7 +460,8 @@ def main():
     market_card = build_market_card(snapshot)
 
     final_html = digest_html + market_card
-    title = f"🛢️ 地缘/原油/美联储简报 · {time.strftime('%m-%d %H:%M')}"
+    # 🌟 顺便把推文标题的时间也修正成北京时间
+    title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
     push_to_wechat(title, final_html)
     print("推送完成。")
 
