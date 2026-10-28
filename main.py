@@ -4,6 +4,7 @@ import time
 import datetime
 import hashlib
 import html
+import re
 import feedparser
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,7 +36,6 @@ FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
 TRUMP_RSS = "https://www.trumpstruth.org/feed"
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
-# 🌟 关键修改：因为现在2小时推一次，所以只抓过去 2.5 小时的新闻，避免大量重复
 HOURS_LOOKBACK = 2.5
 
 MARKET_SYMBOLS = [
@@ -47,7 +47,6 @@ MARKET_SYMBOLS = [
 
 
 def format_time(ts: float | None) -> str:
-    """将 UTC 时间戳转换为北京时间 (UTC+8) 的 MM-DD HH:MM 格式"""
     if not ts:
         return "未知时间"
     dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(hours=8)
@@ -55,7 +54,6 @@ def format_time(ts: float | None) -> str:
 
 
 def get_beijing_time_now() -> str:
-    """获取当前的北京时间字符串"""
     dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     return dt.strftime("%m-%d %H:%M")
 
@@ -256,7 +254,7 @@ def build_market_card(snapshot: list[dict]) -> str:
     note_text = " ".join(notes) if notes else "三个标的近几小时均未出现超出常规阈值的显著异动，以等待关键事件驱动为主。"
 
     return (
-        '<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
+        '<div style="clear:both; margin-top:16px; background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
         '<div style="font-size:14px;font-weight:bold;color:#1a1a1a;'
         'border-left:3px solid #3498db;padding-left:8px;margin-bottom:10px;">'
         "📊 行情速览与异动"
@@ -344,12 +342,13 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 2. 时间格式统一为 `MM-DD HH:MM`（直接使用提供的时间）。
 3. 必须使用下方指定的 HTML 小字样式跟在文字后面：`<span style="font-size:12px;color:#888;background:#f0f1f3;padding:2px 6px;border-radius:4px;margin-left:6px;">10-28 14:30</span>`。
 
-## 四、HTML 硬性约束
+## 四、HTML 硬性约束（防崩溃核心）
 
 1. 只输出 HTML 片段本体，不要 ```html 代码块标记，不要任何解释性文字。
 2. 所有样式必须内联。禁止 <script>、<style> 标签、外部 CSS、外部字体、class 选择器。
 3. 禁止 flex、grid、position: fixed/sticky、transform 等布局属性。
-4. 整封简报外层用 <div style="font-family:-apple-system,'PingFang SC',sans-serif;font-size:14px;color:#333;line-height:1.6;"> 包裹。
+4. **每一个 `<div>` 和 `<span>` 标签都必须有严格的闭合 `</div>` 和 `</span>`，绝不能出现漏闭合情况。** 这非常重要，否则会导致微信排版崩溃。
+5. 整封简报外层用 `<div style="font-family:-apple-system,'PingFang SC',sans-serif;font-size:14px;color:#333;line-height:1.6;">` 包裹。
 
 ## 五、视觉规范
 
@@ -363,13 +362,28 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 请直接输出最终 HTML。"""
 
 
+def auto_fix_html(html_str: str) -> str:
+    """强制补齐 AI 忘记闭合的 div 和 span 标签，防止嵌套吞噬后面的行情卡片"""
+    open_div = html_str.count('<div')
+    close_div = html_str.count('</div>')
+    if open_div > close_div:
+        html_str += '</div>' * (open_div - close_div)
+    
+    open_span = html_str.count('<span')
+    close_span = html_str.count('</span>')
+    if open_span > close_span:
+        html_str += '</span>' * (open_span - close_span)
+        
+    return html_str
+
+
 def call_deepseek(prompt: str) -> str:
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
     resp = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=1600,
+        max_tokens=2500,  # 🌟 防止输出被截断
     )
     content = resp.choices[0].message.content.strip()
     if content.startswith("```"):
@@ -377,13 +391,20 @@ def call_deepseek(prompt: str) -> str:
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
+    
+    content = re.sub(r'\n+', '\n', content)
+    # 🌟 调用护甲：强行闭合缺失的标签
+    content = auto_fix_html(content)
+    
     return content
 
 
 def push_to_wechat(title: str, html_content: str) -> None:
+    # 🌟 外层双保险
+    safe_html = f'<div style="overflow-x:hidden; width:100%;">{html_content}</div>'
     r = requests.post(
         "https://www.pushplus.plus/send",
-        json={"token": PUSHPLUS_TOKEN, "title": title, "content": html_content, "template": "html"},
+        json={"token": PUSHPLUS_TOKEN, "title": title, "content": safe_html, "template": "html"},
         timeout=15,
     )
     r.raise_for_status()
@@ -459,8 +480,9 @@ def main():
     snapshot = fetch_market_snapshot()
     market_card = build_market_card(snapshot)
 
+    # 由于 call_deepseek 里已经强制补齐了闭合标签，这里拼接绝对不会发生吞噬。
     final_html = digest_html + market_card
-    # 🌟 顺便把推文标题的时间也修正成北京时间
+    
     title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
     push_to_wechat(title, final_html)
     print("推送完成。")
