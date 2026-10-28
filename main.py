@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import datetime
 import hashlib
 import html
 import feedparser
@@ -12,7 +13,6 @@ from openai import OpenAI
 PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
-# 地缘/原油/美联储/特朗普 相关新闻源
 GEO_QUERIES = [
     "Iran US conflict",
     "Strait of Hormuz",
@@ -32,7 +32,7 @@ TRUMP_QUERIES = [
 
 OILPRICE_RSS = "https://oilprice.com/rss/main"
 FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
-TRUMP_RSS = "https://www.trumpstruth.org/feed"  # Truth Social 归档站
+TRUMP_RSS = "https://www.trumpstruth.org/feed"
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
 HOURS_LOOKBACK = 6
@@ -43,6 +43,15 @@ MARKET_SYMBOLS = [
     {"key": "dxy", "name": "美元指数", "eastmoney_id": "100.UDI", "unit": "", "decimals": 2},
 ]
 # =================================================
+
+
+def format_time(ts: float | None) -> str:
+    """将 UTC 时间戳转换为北京时间 (UTC+8) 的 MM-DD HH:MM 格式"""
+    if not ts:
+        return "未知时间"
+    # GitHub Actions 跑在 UTC 时区，这里 +8 小时转为北京时间
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc) + datetime.timedelta(hours=8)
+    return dt.strftime("%m-%d %H:%M")
 
 
 def google_news_url(query: str) -> str:
@@ -262,15 +271,18 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
     trump_items = [it for it in news_items if it["category"] == "trump"]
 
     geo_text = "\n".join(
-        f"[{it['source']}] {it['title']} —— {it['summary']}" for it in geo_items[:25]
+        f"[{it['source']}] (发布时间: {format_time(it['published'])}) {it['title']} —— {it['summary']}" 
+        for it in geo_items[:25]
     ) or "（本时段无新的地缘/原油新闻）"
 
     fed_text = "\n".join(
-        f"[{it['source']}] {it['title']} —— {it['summary']}" for it in fed_items[:15]
+        f"[{it['source']}] (发布时间: {format_time(it['published'])}) {it['title']} —— {it['summary']}" 
+        for it in fed_items[:15]
     ) or "（本时段无新的美联储新闻）"
 
     trump_text = "\n".join(
-        f"[{it['source']}] {it['title']} —— {it['summary']}" for it in trump_items[:20]
+        f"[{it['source']}] (发布时间: {format_time(it['published'])}) {it['title']} —— {it['summary']}" 
+        for it in trump_items[:20]
     ) or "（本时段无新的特朗普公开言论或动态）"
 
     return f"""你是一名专注于地缘政治、原油市场与美联储政策的投研助理。请基于以下过去数小时的信息，生成一份**简洁、可操作**的中文简报，并以微信可直接渲染的 HTML 片段输出，面向实盘投资者。
@@ -304,28 +316,36 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 聚焦利率路径、官员表态、流动性预期。若本时段无实质新信息，明确写“本时段无实质新信息”。
 
 **特朗普动态（2~3 句）**
-总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。**若本时段确实无任何公开动态，请写“本时段无特朗普公开言论”。**
+总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。
 
 **需要盯住的下一个变量（1~2 条）**
 列出即将发生或可能触发的关键事件/时间节点。
 
 语气：冷静、事实导向，不渲染恐慌，不使用“战争一触即发”等标题党措辞。
 
-## 二、HTML 硬性约束
+## 二、时间标注要求（必须严格遵守）
+
+1. 简报中列出的每一条核心事实、每一个特朗普动态，**必须**在其末尾附带该消息的发布时间。
+2. 时间格式统一为 `MM-DD HH:MM`（注意：上面提供的时间已经是北京时间，直接用即可）。
+3. 时间必须使用指定的 HTML 小字样式跟在文字后面：`<span style="font-size:12px;color:#888;background:#f0f1f3;padding:2px 6px;border-radius:4px;margin-left:6px;">10-28 14:30</span>`。
+4. 如果某条研判综合了多个时间点的信息，请标注核心事件的时间。
+5. 行情数据区块不需要加新闻时间。
+
+## 三、HTML 硬性约束
 
 1. 只输出 HTML 片段本体，不要 ```html 代码块标记，不要任何解释性文字。
 2. 所有样式必须内联。禁止 <script>、<style> 标签、外部 CSS、外部字体、class 选择器。
 3. 禁止 flex、grid、position: fixed/sticky、transform 等布局属性。
 4. 整封简报外层用 <div style="font-family:-apple-system,'PingFang SC',sans-serif;font-size:14px;color:#333;line-height:1.6;"> 包裹。
 
-## 三、视觉规范
+## 四、视觉规范
 
 - 每个内容区块一个卡片：背景 #f7f8fa，圆角 12px，padding 14px 16px，margin-bottom 12px。
 - 区块标题：14px 加粗，#1a1a1a，左侧 3px 竖条强调色。
 - 正文：14px，#333，行高 1.6。
-- **重点强调**：特朗普动态板块的标题强调色，如果有涉及能源/伊朗的强硬表态，用 #e74c3c（暖红）；如果是常规政策宣传或无关言论，用 #f39c12（琥珀）；如果无动态，用 #95a5a6（灰）。
+- 强调色：升级/供应中断/鹰派/涉伊强硬表态 → #e74c3c；僵持/中性/常规政策 → #f39c12；缓和/无新信息 → #95a5a6。
 - 区块顺序固定：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ **特朗普动态** ⑥ 下一个变量。
-- 美联储若“无实质新信息”，收窄为浅灰单行提示；特朗普若“无公开言论”，也收窄为浅灰单行提示。
+- 美联储或特朗普若“无新信息/无言论”，收窄为浅灰单行提示。
 
 请直接输出最终 HTML。"""
 
@@ -362,10 +382,12 @@ def build_fallback_html(items: list[dict], market_card: str) -> str:
     for it in items[:20]:
         cat_map = {"geo": "地缘/原油", "fed": "美联储", "trump": "特朗普动态"}
         cat = cat_map.get(it["category"], "其他")
+        pub_time = format_time(it["published"])
         rows.append(
             '<div style="padding:8px 0;border-bottom:1px solid #eee;">'
             f'<span style="font-size:12px;color:#888;">[{html.escape(cat)}]</span> '
             f'<span style="font-size:14px;color:#333;">{html.escape(it["title"])}</span>'
+            f'<span style="font-size:11px;color:#999;margin-left:8px;">({pub_time})</span>'
             "</div>"
         )
     body = "".join(rows)
