@@ -2,9 +2,9 @@ name: Geopolitical & Oil Monitor
 
 on:
   schedule:
-    # UTC 时间，每 3 小时一次（北京时间 0,3,6,9,12,15,18,21 点）
-    - cron: "30 16 * * *"
-  workflow_dispatch:
+    # 测试用：每 5 分钟触发一次（注意：GitHub 免费版有延迟，可能不会刚好卡在 5 分钟）
+    - cron: "*/5 * * * *"
+  workflow_dispatch:  # 支持手动触发
 
 jobs:
   monitor:
