@@ -29,6 +29,12 @@ FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
 HOURS_LOOKBACK = 6
+
+MARKET_SYMBOLS = [
+    {"key": "brent", "name": "布伦特原油", "eastmoney_id": "112.B00Y", "unit": "美元/桶", "decimals": 2},
+    {"key": "gold", "name": "伦敦金", "eastmoney_id": "101.GC00Y", "unit": "美元/盎司", "decimals": 1},
+    {"key": "dxy", "name": "美元指数", "eastmoney_id": "100.UDI", "unit": "", "decimals": 2},
+]
 # =================================================
 
 
@@ -49,9 +55,7 @@ def fetch_rss(url: str, source_name: str, category: str) -> list[dict]:
                 published = time.mktime(e.published_parsed)
             elif hasattr(e, "updated_parsed") and e.updated_parsed:
                 published = time.mktime(e.updated_parsed)
-            if published is None:
-                continue
-            if published < cutoff:
+            if published is None or published < cutoff:
                 continue
             entries.append({
                 "source": source_name,
@@ -87,6 +91,134 @@ def deduplicate(items: list[dict]) -> list[dict]:
     return out
 
 
+# ---------- 行情快照 ----------
+
+def fetch_quote(symbol: dict) -> dict | None:
+    """从东方财富获取单个标的的实时报价。"""
+    try:
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {"secid": symbol["eastmoney_id"], "fields": "f43,f60,f170"}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data")
+        if not data:
+            return None
+
+        latest_raw = data.get("f43")
+        prev_raw = data.get("f60")
+        pct_raw = data.get("f170")
+        if latest_raw is None or prev_raw is None:
+            return None
+
+        pct = float(pct_raw) / 100 if pct_raw is not None else None
+
+        # 东方财富不同品种的缩放比例不同，用涨跌幅验证哪个缩放合理
+        price = None
+        for scale in (100, 1000, 1):
+            p = float(latest_raw) / scale
+            prev = float(prev_raw) / scale
+            if prev == 0 or not (0.01 < p < 100000):
+                continue
+            implied = (p - prev) / prev * 100
+            if pct is None or abs(implied - pct) < 1.5:
+                price = p
+                break
+
+        if price is None:
+            price = float(latest_raw) / 100  # 兜底：外盘期货默认 /100
+
+        return {
+            "name": symbol["name"],
+            "price": round(price, symbol["decimals"]),
+            "change_pct": round(pct, 2) if pct is not None else 0.0,
+            "unit": symbol["unit"],
+        }
+    except Exception as exc:
+        print(f"[行情失败] {symbol['name']}: {exc}")
+        return None
+
+
+def fetch_market_snapshot() -> list[dict]:
+    snapshot = []
+    for sym in MARKET_SYMBOLS:
+        q = fetch_quote(sym)
+        if q:
+            snapshot.append(q)
+        else:
+            snapshot.append({"name": sym["name"], "price": None, "change_pct": None, "unit": sym["unit"]})
+    return snapshot
+
+
+def _color(pct: float | None) -> str:
+    if pct is None:
+        return "#888"
+    return "#e74c3c" if pct > 0 else ("#27ae60" if pct < 0 else "#888")
+
+
+def _sign(pct: float | None) -> str:
+    if pct is None:
+        return "—"
+    return f"+{pct:.2f}%" if pct > 0 else f"{pct:.2f}%"
+
+
+def build_market_card(snapshot: list[dict]) -> str:
+    rows = []
+    for q in snapshot:
+        pct = q["change_pct"]
+        color = _color(pct)
+        if q["price"] is not None:
+            price_text = f"{q['price']:,.{len(str(q['price']).split('.')[-1])}f}"
+        else:
+            price_text = "—"
+        unit = f" {q['unit']}" if q["unit"] else ""
+        rows.append(
+            '<div style="display:inline-block;width:31%;vertical-align:top;margin-right:2%;'
+            'background:#fff;border-radius:10px;padding:10px 8px;text-align:center;'
+            'border:1px solid #eee;">'
+            f'<div style="font-size:12px;color:#666;margin-bottom:6px;">{html.escape(q["name"])}</div>'
+            f'<div style="font-size:16px;font-weight:bold;color:{color};margin-bottom:4px;">'
+            f'{price_text}{unit}</div>'
+            f'<div style="font-size:14px;font-weight:bold;color:{color};">{_sign(pct)}</div>'
+            "</div>"
+        )
+    cards_html = "".join(rows)
+
+    # 基于阈值的简短异动判断（确定性规则，不依赖 AI）
+    notes = []
+    brent = next((q for q in snapshot if q["name"] == "布伦特原油"), None)
+    gold = next((q for q in snapshot if q["name"] == "伦敦金"), None)
+    dxy = next((q for q in snapshot if q["name"] == "美元指数"), None)
+
+    if brent and brent["change_pct"] is not None and abs(brent["change_pct"]) >= 1.5:
+        direction = "走强" if brent["change_pct"] > 0 else "走弱"
+        notes.append(f"原油近几小时明显{direction}（{_sign(brent['change_pct'])}），地缘风险溢价仍在反复定价。")
+    if gold and gold["change_pct"] is not None and abs(gold["change_pct"]) >= 1.0:
+        notes.append(f"黄金出现{abs(gold['change_pct']):.1f}%级别波动，与油价及美元走势联动明显。")
+    if brent and gold and brent["change_pct"] is not None and gold["change_pct"] is not None:
+        if brent["change_pct"] > 0 and gold["change_pct"] < 0:
+            notes.append("油涨金跌，市场更关注供应端而非避险，通胀-紧缩逻辑仍在主导。")
+        elif brent["change_pct"] < 0 and gold["change_pct"] > 0:
+            notes.append("油跌金涨，与“油价回落→通胀担忧缓和→金价获得喘息”的传导一致。")
+    if dxy and dxy["change_pct"] is not None and abs(dxy["change_pct"]) < 0.15:
+        notes.append("美元指数窄幅持稳，等待美联储决议给出方向。")
+
+    note_text = " ".join(notes) if notes else "三个标的近几小时均未出现超出常规阈值的显著异动，以等待关键事件驱动为主。"
+
+    return (
+        '<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
+        '<div style="font-size:14px;font-weight:bold;color:#1a1a1a;'
+        'border-left:3px solid #3498db;padding-left:8px;margin-bottom:10px;">'
+        "📊 行情速览与异动"
+        "</div>"
+        f'<div style="margin-bottom:10px;">{cards_html}</div>'
+        f'<div style="font-size:13px;color:#555;line-height:1.6;background:#fff;'
+        f'border-radius:8px;padding:8px 10px;">{html.escape(note_text)}</div>'
+        "</div>"
+    )
+
+
+# ---------- AI 简报 ----------
+
 def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
     geo_items = [it for it in news_items if it["category"] == "geo"]
     fed_items = [it for it in news_items if it["category"] == "fed"]
@@ -112,7 +244,7 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 
 ---
 
-## 一、内容要求（先想清楚内容，再写 HTML）
+## 一、内容要求
 
 **核心事实（3~5 条）**
 只列出对“美伊冲突/霍尔木兹通行/原油供应/美联储政策”有实质影响的事实，地缘与美联储可混合列出，每条一句话。
@@ -121,46 +253,37 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 判断当前局势是在升级、僵持还是缓和，以及对霍尔木兹航运的实际威胁程度。
 
 **原油价格信号（2~3 句）**
-结合新闻措辞（如“供应中断”“fees”“closure”等），给出对油价的偏多/偏空/中性倾向，不要给出具体点位。
+结合新闻措辞，给出对油价的偏多/偏空/中性倾向，不要给出具体点位。
 
 **美联储动态与政策信号（2~3 句）**
-聚焦利率路径、官员表态、流动性预期，并说明其对美元及原油的间接影响。若本时段无实质新信息，明确写“本时段无实质新信息”。
+聚焦利率路径、官员表态、流动性预期。若本时段无实质新信息，明确写“本时段无实质新信息”。
 
 **需要盯住的下一个变量（1~2 条）**
-列出即将发生或可能触发的关键事件/时间节点，地缘与美联储均可。
+列出即将发生或可能触发的关键事件/时间节点。
 
 语气：冷静、事实导向，不渲染恐慌，不使用“战争一触即发”等标题党措辞。
 
-## 二、HTML 硬性约束（必须严格遵守）
+## 二、HTML 硬性约束
 
-1. 只输出 HTML 片段本体，**不要** ```html 代码块标记，不要任何解释性文字。
-2. 所有样式必须**内联**（写在 style="..." 中）。**禁止** <script>、<style> 标签、外部 CSS、外部字体、class 选择器。
-3. **禁止** flex、grid、position: fixed/sticky、transform 等微信可能不兼容的布局属性。使用普通块级 <div> 加 margin/padding 实现间距。
+1. 只输出 HTML 片段本体，不要 ```html 代码块标记，不要任何解释性文字。
+2. 所有样式必须内联。禁止 <script>、<style> 标签、外部 CSS、外部字体、class 选择器。
+3. 禁止 flex、grid、position: fixed/sticky、transform 等布局属性。
 4. 整封简报外层用 <div style="font-family:-apple-system,'PingFang SC',sans-serif;font-size:14px;color:#333;line-height:1.6;"> 包裹。
 
-## 三、HTML 视觉规范
+## 三、视觉规范
 
-- **整体**：每个内容区块用一个卡片 <div>：背景 #f7f8fa，圆角 12px，padding 14px 16px，margin-bottom 12px。
-- **区块标题**：14px 加粗，#1a1a1a，margin-bottom 8px，左侧 3px 竖条强调色。
-- **正文**：14px，#333，行高 1.6。
-- **辅助/无新信息提示**：12px，#888，浅灰背景 #f0f1f3，圆角 8px，padding 8px 10px。
-- **强调色按内容自适应**：
-  - 局势升级 / 供应中断 / 鹰派超预期 → 强调色 #e74c3c（暖红）
-  - 僵持 / 混合信号 / 中性 → 强调色 #f39c12（琥珀）
-  - 缓和 / 无实质新信息 → 强调色 #95a5a6（灰）
-  每个卡片根据其内容自行选择合适的强调色，同一封简报内可混用。
-- **核心事实**：每条事实单独一行，行首用一个带强调色的小方块符号（用 <span style="display:inline-block;width:6px;height:6px;background:#e74c3c;border-radius:2px;margin-right:8px;vertical-align:middle;"></span> 表示，颜色随事实性质变化）。
-- **五个区块顺序固定**：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ 下一个变量。
-- 美联储若“无实质新信息”，该区块内容用一个浅灰单行提示块呈现，不要展开成大段文字，区块标题强调色用 #95a5a6。
+- 每个内容区块一个卡片：背景 #f7f8fa，圆角 12px，padding 14px 16px，margin-bottom 12px。
+- 区块标题：14px 加粗，#1a1a1a，左侧 3px 竖条强调色。
+- 正文：14px，#333，行高 1.6。
+- 强调色：升级/供应中断/鹰派 → #e74c3c；僵持/中性 → #f39c12；缓和/无新信息 → #95a5a6。
+- 五个区块顺序固定：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ 下一个变量。
+- 美联储若“无实质新信息”，收窄为浅灰单行提示。
 
 请直接输出最终 HTML。"""
 
 
 def call_deepseek(prompt: str) -> str:
-    client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com",
-    )
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
     resp = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
@@ -168,7 +291,6 @@ def call_deepseek(prompt: str) -> str:
         max_tokens=1600,
     )
     content = resp.choices[0].message.content.strip()
-    # 容错：若模型仍包了代码块标记，剥掉
     if content.startswith("```"):
         content = content.split("\n", 1)[-1]
         if content.endswith("```"):
@@ -180,20 +302,14 @@ def call_deepseek(prompt: str) -> str:
 def push_to_wechat(title: str, html_content: str) -> None:
     r = requests.post(
         "https://www.pushplus.plus/send",
-        json={
-            "token": PUSHPLUS_TOKEN,
-            "title": title,
-            "content": html_content,
-            "template": "html",
-        },
+        json={"token": PUSHPLUS_TOKEN, "title": title, "content": html_content, "template": "html"},
         timeout=15,
     )
     r.raise_for_status()
     print(f"[PushPlus] {r.json()}")
 
 
-def build_fallback_html(items: list[dict]) -> str:
-    """DeepSeek 失败时的降级推送：简单 HTML 列表，避免 html 模板下显示乱码。"""
+def build_fallback_html(items: list[dict], market_card: str) -> str:
     rows = []
     for it in items[:20]:
         cat = "地缘/原油" if it["category"] == "geo" else "美联储"
@@ -208,45 +324,59 @@ def build_fallback_html(items: list[dict]) -> str:
         '<div style="font-family:-apple-system,\'PingFang SC\',sans-serif;line-height:1.6;">'
         '<div style="background:#fff3cd;border-left:3px solid #f39c12;padding:10px 14px;'
         'border-radius:8px;margin-bottom:12px;font-size:13px;color:#856404;">'
-        "AI 研判暂不可用，以下为原始新闻标题，供快速浏览。"
+        "AI 研判暂不可用，以下为行情快照与原始新闻标题。"
         "</div>"
+        f"{market_card}"
         f'<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;">{body}</div>'
         "</div>"
     )
 
 
 def main():
-    tasks = []
+    # 1. 并行抓取新闻（不含行情，行情放到推送前才拉）
     with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
         for q in GEO_QUERIES:
-            tasks.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "geo"))
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "geo"))
         for q in FED_QUERIES:
-            tasks.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "fed"))
-        tasks.append(pool.submit(fetch_rss, OILPRICE_RSS, "OilPrice", "geo"))
-        tasks.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "fed"))
+        futures.append(pool.submit(fetch_rss, OILPRICE_RSS, "OilPrice", "geo"))
+        futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
 
         all_items = []
-        for fut in as_completed(tasks):
+        for fut in as_completed(futures):
             all_items.extend(fut.result())
 
     all_items = deduplicate(all_items)
+
+    # 2. 没有新闻时，只推行情
     if not all_items:
-        print("过去数小时没有抓到新内容，跳过本次推送。")
+        print("过去数小时没有抓到新内容，仅推送行情快照。")
+        snapshot = fetch_market_snapshot()
+        market_card = build_market_card(snapshot)
+        push_to_wechat(f"📊 行情速览 · {time.strftime('%m-%d %H:%M')}", market_card)
         return
 
+    # 3. AI 研判
     hormuz_json = fetch_hormuz_status()
-
     prompt = build_prompt(all_items, hormuz_json)
+
     try:
         digest_html = call_deepseek(prompt)
     except Exception as exc:
         print(f"[DeepSeek 失败] {exc}")
-        fallback_html = build_fallback_html(all_items)
-        push_to_wechat("⚠️ 地缘/原油/美联储监控（AI 降级）", fallback_html)
+        snapshot = fetch_market_snapshot()
+        market_card = build_market_card(snapshot)
+        push_to_wechat("⚠️ 监控简报（AI 降级）", build_fallback_html(all_items, market_card))
         return
 
+    # 4. 推送前才拉行情，确保尽量接近发送时刻
+    snapshot = fetch_market_snapshot()
+    market_card = build_market_card(snapshot)
+
+    final_html = digest_html + market_card
     title = f"🛢️ 地缘/原油/美联储简报 · {time.strftime('%m-%d %H:%M')}"
-    push_to_wechat(title, digest_html)
+    push_to_wechat(title, final_html)
     print("推送完成。")
 
 
