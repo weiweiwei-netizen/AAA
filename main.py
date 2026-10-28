@@ -12,6 +12,7 @@ from openai import OpenAI
 PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
+# 地缘/原油/美联储/特朗普 相关新闻源
 GEO_QUERIES = [
     "Iran US conflict",
     "Strait of Hormuz",
@@ -24,8 +25,14 @@ FED_QUERIES = [
     "FOMC rate decision",
 ]
 
+TRUMP_QUERIES = [
+    "\"Donald Trump\" statement",
+    "\"Donald Trump\" speech",
+]
+
 OILPRICE_RSS = "https://oilprice.com/rss/main"
 FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
+TRUMP_RSS = "https://www.trumpstruth.org/feed"  # Truth Social 归档站
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
 HOURS_LOOKBACK = 6
@@ -95,13 +102,12 @@ def deduplicate(items: list[dict]) -> list[dict]:
 
 def fetch_quote(symbol: dict) -> dict | None:
     """获取实时报价：优先东方财富，失败时回退 Yahoo Finance。"""
-    # ---------- 源 1：东方财富 ----------
     try:
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {
             "secid": symbol["eastmoney_id"],
             "fields": "f43,f60,f170",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 东方财富公共令牌
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         }
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -137,12 +143,7 @@ def fetch_quote(symbol: dict) -> dict | None:
     except Exception as exc:
         print(f"[东方财富失败] {symbol['name']}: {exc}")
 
-    # ---------- 源 2：Yahoo Finance 备用 ----------
-    yahoo_map = {
-        "brent": "BZ=F",
-        "gold": "GC=F",
-        "dxy": "DX-Y.NYB",
-    }
+    yahoo_map = {"brent": "BZ=F", "gold": "GC=F", "dxy": "DX-Y.NYB"}
     yahoo_ticker = yahoo_map.get(symbol["key"])
     if not yahoo_ticker:
         return None
@@ -258,6 +259,7 @@ def build_market_card(snapshot: list[dict]) -> str:
 def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
     geo_items = [it for it in news_items if it["category"] == "geo"]
     fed_items = [it for it in news_items if it["category"] == "fed"]
+    trump_items = [it for it in news_items if it["category"] == "trump"]
 
     geo_text = "\n".join(
         f"[{it['source']}] {it['title']} —— {it['summary']}" for it in geo_items[:25]
@@ -266,6 +268,10 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
     fed_text = "\n".join(
         f"[{it['source']}] {it['title']} —— {it['summary']}" for it in fed_items[:15]
     ) or "（本时段无新的美联储新闻）"
+
+    trump_text = "\n".join(
+        f"[{it['source']}] {it['title']} —— {it['summary']}" for it in trump_items[:20]
+    ) or "（本时段无新的特朗普公开言论或动态）"
 
     return f"""你是一名专注于地缘政治、原油市场与美联储政策的投研助理。请基于以下过去数小时的信息，生成一份**简洁、可操作**的中文简报，并以微信可直接渲染的 HTML 片段输出，面向实盘投资者。
 
@@ -278,12 +284,15 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 ## 美联储新闻
 {fed_text}
 
+## 特朗普动态（Truth Social 发帖 / 公开讲话 / 政策表态）
+{trump_text}
+
 ---
 
 ## 一、内容要求
 
 **核心事实（3~5 条）**
-只列出对“美伊冲突/霍尔木兹通行/原油供应/美联储政策”有实质影响的事实，地缘与美联储可混合列出，每条一句话。
+只列出对“美伊冲突/霍尔木兹通行/原油供应/美联储政策/特朗普政策”有实质影响的事实，每条一句话。
 
 **地缘与供应研判（2~3 句）**
 判断当前局势是在升级、僵持还是缓和，以及对霍尔木兹航运的实际威胁程度。
@@ -293,6 +302,9 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 
 **美联储动态与政策信号（2~3 句）**
 聚焦利率路径、官员表态、流动性预期。若本时段无实质新信息，明确写“本时段无实质新信息”。
+
+**特朗普动态（2~3 句）**
+总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。**若本时段确实无任何公开动态，请写“本时段无特朗普公开言论”。**
 
 **需要盯住的下一个变量（1~2 条）**
 列出即将发生或可能触发的关键事件/时间节点。
@@ -311,9 +323,9 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 - 每个内容区块一个卡片：背景 #f7f8fa，圆角 12px，padding 14px 16px，margin-bottom 12px。
 - 区块标题：14px 加粗，#1a1a1a，左侧 3px 竖条强调色。
 - 正文：14px，#333，行高 1.6。
-- 强调色：升级/供应中断/鹰派 → #e74c3c；僵持/中性 → #f39c12；缓和/无新信息 → #95a5a6。
-- 五个区块顺序固定：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ 下一个变量。
-- 美联储若“无实质新信息”，收窄为浅灰单行提示。
+- **重点强调**：特朗普动态板块的标题强调色，如果有涉及能源/伊朗的强硬表态，用 #e74c3c（暖红）；如果是常规政策宣传或无关言论，用 #f39c12（琥珀）；如果无动态，用 #95a5a6（灰）。
+- 区块顺序固定：① 核心事实 ② 地缘与供应 ③ 原油信号 ④ 美联储动态 ⑤ **特朗普动态** ⑥ 下一个变量。
+- 美联储若“无实质新信息”，收窄为浅灰单行提示；特朗普若“无公开言论”，也收窄为浅灰单行提示。
 
 请直接输出最终 HTML。"""
 
@@ -348,7 +360,8 @@ def push_to_wechat(title: str, html_content: str) -> None:
 def build_fallback_html(items: list[dict], market_card: str) -> str:
     rows = []
     for it in items[:20]:
-        cat = "地缘/原油" if it["category"] == "geo" else "美联储"
+        cat_map = {"geo": "地缘/原油", "fed": "美联储", "trump": "特朗普动态"}
+        cat = cat_map.get(it["category"], "其他")
         rows.append(
             '<div style="padding:8px 0;border-bottom:1px solid #eee;">'
             f'<span style="font-size:12px;color:#888;">[{html.escape(cat)}]</span> '
@@ -369,15 +382,18 @@ def build_fallback_html(items: list[dict], market_card: str) -> str:
 
 
 def main():
-    # 1. 并行抓取新闻（不含行情，行情放到推送前才拉）
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         futures = []
         for q in GEO_QUERIES:
             futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "geo"))
         for q in FED_QUERIES:
             futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "fed"))
+        for q in TRUMP_QUERIES:
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "trump"))
+        
         futures.append(pool.submit(fetch_rss, OILPRICE_RSS, "OilPrice", "geo"))
         futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
+        futures.append(pool.submit(fetch_rss, TRUMP_RSS, "TruthSocial", "trump"))
 
         all_items = []
         for fut in as_completed(futures):
@@ -385,7 +401,6 @@ def main():
 
     all_items = deduplicate(all_items)
 
-    # 2. 没有新闻时，只推行情
     if not all_items:
         print("过去数小时没有抓到新内容，仅推送行情快照。")
         snapshot = fetch_market_snapshot()
@@ -393,7 +408,6 @@ def main():
         push_to_wechat(f"📊 行情速览 · {time.strftime('%m-%d %H:%M')}", market_card)
         return
 
-    # 3. AI 研判
     hormuz_json = fetch_hormuz_status()
     prompt = build_prompt(all_items, hormuz_json)
 
@@ -406,7 +420,6 @@ def main():
         push_to_wechat("⚠️ 监控简报（AI 降级）", build_fallback_html(all_items, market_card))
         return
 
-    # 4. 推送前才拉行情，确保尽量接近发送时刻
     snapshot = fetch_market_snapshot()
     market_card = build_market_card(snapshot)
 
