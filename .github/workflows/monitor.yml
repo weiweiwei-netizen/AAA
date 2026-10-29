@@ -1,26 +1,23 @@
 name: Geopolitical & Oil Monitor
 
 on:
+  # 保留 schedule 作为备用触发方式，以防外部服务异常
   schedule:
-    # 每 2 小时的 15 分触发（UTC时间），对应北京时间 0:15, 2:15, 4:15...
-    - cron: "15 */2 * * *"
-  workflow_dispatch:  # 支持手动触发
+    - cron: "15 */2 * * *" 
+  # 关键：添加 workflow_dispatch 触发器，允许外部 API 调用
+  workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run monitor
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
