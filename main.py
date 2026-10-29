@@ -117,18 +117,39 @@ def deduplicate(items: list[dict]) -> list[dict]:
 def fetch_fedwatch_card() -> tuple[str, str]:
     """获取 CME FedWatch 利率预期，返回 (HTML卡片, 给AI的纯文本摘要)"""
     try:
-        # 默认获取下一次 FOMC 会议的利率概率分布
-        data = get_probabilities("next")
-        meetings = data.get("meetings", [])
-        if not meetings:
+        # 1. 获取所有已知的未来 FOMC 会议概率数据
+        all_data = get_probabilities()  # 不传参数，返回所有未来会议
+        
+        if not all_data or "meetings" not in all_data:
             return "", "（本时段未获取到 FedWatch 利率预期数据）"
 
-        m = meetings[0]
-        meeting_date = m.get("date", "未知")
-        probs = m.get("probabilities", {})
-        current_target = data.get("current_target", "未知")
+        meetings = all_data["meetings"]
+        today = datetime.datetime.now(datetime.timezone.utc).date()
 
-        # 整理为文本形式供 AI 研判
+        # 2. 核心修复：从会议列表中，筛选出第一个日期 >= 今天的会议
+        future_meetings = []
+        for m in meetings:
+            try:
+                meeting_date = datetime.datetime.strptime(m["date"], "%Y-%m-%d").date()
+                if meeting_date >= today:
+                    future_meetings.append(m)
+            except (ValueError, KeyError):
+                continue
+        
+        # 如果所有会议都在过去，则无法给出预期
+        if not future_meetings:
+            return "", "（FedWatch 数据中暂无未来的 FOMC 会议）"
+        
+        # 排序并取最近的一个未来会议
+        future_meetings.sort(key=lambda x: x["date"])
+        m = future_meetings[0]
+        
+        meeting_date_str = m["date"]
+        probs = m["probabilities"]
+        current_target = all_data.get("current_target", "未知")
+        trade_date = all_data.get("trade_date", "未知")
+
+        # 3. 整理为文本形式供 AI 研判
         prob_lines = []
         for rate_range, prob in probs.items():
             if prob > 0:
@@ -136,16 +157,16 @@ def fetch_fedwatch_card() -> tuple[str, str]:
         probs_text = "、".join(prob_lines)
 
         ai_summary = (
-            f"下一次 FOMC 会议日期：{meeting_date}，当前基准利率区间：{current_target}。"
+            f"下一次 FOMC 会议日期：{meeting_date_str}（数据基准日：{trade_date}），"
+            f"当前基准利率区间：{current_target}。"
             f"市场隐含概率分布为：{probs_text}。"
         )
 
-        # 构建 HTML 卡片
+        # 4. 构建 HTML 卡片
         rows = []
         for rate_range, prob in probs.items():
             if prob <= 0:
                 continue
-            # 概率大于50%的代表性概率显示为红色，其余为灰色
             color = "#e74c3c" if prob >= 50 else "#888"
             rows.append(
                 '<div style="display:inline-block;width:48%;vertical-align:top;margin-bottom:6px;">'
@@ -156,12 +177,12 @@ def fetch_fedwatch_card() -> tuple[str, str]:
         cards_html = "".join(rows)
 
         fedwatch_html = (
-            '<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
+            '<div style="clear:both; margin-top:16px; background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
             '<div style="font-size:14px;font-weight:bold;color:#1a1a1a;'
             'border-left:3px solid #9b59b6;padding-left:8px;margin-bottom:10px;">'
-            f"🎯 CME FedWatch · 下次会议 {meeting_date}"
+            f"🎯 CME FedWatch · 下次会议 {meeting_date_str}"
             "</div>"
-            f'<div style="font-size:12px;color:#666;margin-bottom:8px;">当前基准利率区间：{current_target}</div>'
+            f'<div style="font-size:12px;color:#666;margin-bottom:8px;">当前基准利率区间：{current_target} · 数据基准日：{trade_date}</div>'
             f'<div style="background:#fff;border-radius:8px;padding:10px;">{cards_html}</div>'
             "</div>"
         )
@@ -491,8 +512,8 @@ def build_fallback_html(items: list[dict], market_card: str, fedwatch_card: str)
         'border-radius:8px;margin-bottom:12px;font-size:13px;color:#856404;">'
         "AI 研判暂不可用，以下为行情快照、FedWatch 与原始新闻标题。"
         "</div>"
-        f"{fedwatch_card}"
         f"{market_card}"
+        f"{fedwatch_card}"
         f'<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;">{body}</div>'
         "</div>"
     )
@@ -512,7 +533,7 @@ def main():
         futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
         futures.append(pool.submit(fetch_rss, TRUMP_RSS, "TruthSocial", "trump"))
 
-        # 同时并行获取 FedWatch 数据
+        # 并行获取 FedWatch 数据
         fedwatch_future = pool.submit(fetch_fedwatch_card)
 
         all_items = []
@@ -528,7 +549,7 @@ def main():
         print("过去数小时没有抓到新内容，仅推送行情快照与FedWatch。")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        final_html = fedwatch_card + market_card
+        final_html = market_card + fedwatch_card
         push_to_wechat(f"📊 行情与FedWatch速览 · {get_beijing_time_now()}", final_html)
         return
 
@@ -547,7 +568,7 @@ def main():
     snapshot = fetch_market_snapshot()
     market_card = build_market_card(snapshot)
 
-    # 组装最终推送，FedWatch 卡片放在最下方，行情卡片在它上方
+    # 组装最终推送，行情卡片在AI简报下方，FedWatch在最底部
     final_html = digest_html + market_card + fedwatch_card
     
     title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
