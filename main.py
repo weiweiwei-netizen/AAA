@@ -15,6 +15,9 @@ from cme_fedwatch import get_probabilities
 PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
+# 🌟 已经填入你的群组编码
+PUSHPLUS_TOPIC = "88888888" 
+
 GEO_QUERIES = [
     "Iran US conflict",
     "Strait of Hormuz",
@@ -475,13 +478,27 @@ def call_deepseek(prompt: str) -> str:
 
 def push_to_wechat(title: str, html_content: str) -> None:
     safe_html = f'<div style="overflow-x:hidden; width:100%;">{html_content}</div>'
+    
+    payload = {
+        "token": PUSHPLUS_TOKEN,
+        "title": title,
+        "content": safe_html,
+        "template": "html"
+    }
+    
+    if PUSHPLUS_TOPIC:
+        payload["topic"] = PUSHPLUS_TOPIC
+        print(f"[PushPlus] 正在推送到群组: {PUSHPLUS_TOPIC}")
+    else:
+        print("[PushPlus] 正在推送给个人（未配置 topic）")
+
     r = requests.post(
         "https://www.pushplus.plus/send",
-        json={"token": PUSHPLUS_TOKEN, "title": title, "content": safe_html, "template": "html"},
+        json=payload,
         timeout=15,
     )
     r.raise_for_status()
-    print(f"[PushPlus] {r.json()}")
+    print(f"[PushPlus 响应] {r.json()}")
 
 
 def build_fallback_html(items: list[dict], market_card: str, fedwatch_card: str) -> str:
@@ -513,23 +530,13 @@ def build_fallback_html(items: list[dict], market_card: str, fedwatch_card: str)
 
 
 def main():
-    now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
-    current_hour = now.hour
+    # 🌟 已经移除了夜间静默的逻辑，保证随时可以测试
     
-    # 1. 夜间静默期（北京时间 0:00 - 7:59）
-    if 0 <= current_hour < 8:
-        print(f"[{get_beijing_time_now()}] 当前处于夜间静默期，跳过本次推送。")
-        return
-        
-    # 2. 设定动态抓取时间窗口
-    if 8 <= current_hour < 10:
-        lookback = 8.5  # 覆盖从昨晚 23:30 到今早 8:00 的新闻
-        is_morning_summary = True
-        print(f"[{get_beijing_time_now()}] 处于早间汇总模式，抓取过去 {lookback} 小时的新闻。")
-    else:
-        lookback = 2.5
-        is_morning_summary = False
-        print(f"[{get_beijing_time_now()}] 常规推送模式，抓取过去 {lookback} 小时的新闻。")
+    # 测试阶段，统一使用 2.5 小时窗口
+    lookback = 2.5
+    is_morning_summary = False
+    
+    print(f"[{get_beijing_time_now()}] 测试模式：抓取过去 {lookback} 小时的新闻。")
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = []
@@ -558,7 +565,7 @@ def main():
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
         final_html = market_card + fedwatch_card
-        push_title = f"☀️ 早间汇总（无新消息） · {get_beijing_time_now()}" if is_morning_summary else f"📊 行情与FedWatch速览 · {get_beijing_time_now()}"
+        push_title = f"📊 行情与FedWatch速览 · {get_beijing_time_now()}"
         push_to_wechat(push_title, final_html)
         return
 
@@ -571,7 +578,7 @@ def main():
         print(f"[DeepSeek 失败] {exc}")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        fallback_title = "⚠️ 早间汇总（AI降级）" if is_morning_summary else "⚠️ 监控简报（AI降级）"
+        fallback_title = "⚠️ 监控简报（AI降级）"
         push_to_wechat(fallback_title, build_fallback_html(all_items, market_card, fedwatch_card))
         return
 
@@ -580,10 +587,7 @@ def main():
 
     final_html = digest_html + market_card + fedwatch_card
     
-    if is_morning_summary:
-        title = f"☀️ 地缘/原油/美联储早间汇总 · {get_beijing_time_now()}"
-    else:
-        title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
+    title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
         
     push_to_wechat(title, final_html)
     print("推送完成。")
