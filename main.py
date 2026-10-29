@@ -9,7 +9,7 @@ import feedparser
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
-from cme_fedwatch import get_probabilities  # 导入 FedWatch 核心包
+from cme_fedwatch import get_probabilities
 
 # ==================== 配置区 ====================
 PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
@@ -37,8 +37,6 @@ FED_PRESS_RSS = "https://www.federalreserve.gov/feeds/press_all.xml"
 TRUMP_RSS = "https://www.trumpstruth.org/feed"
 EAGLE_HORMUZ_API = "https://eagleintelmari.com/api/hormuz-status"
 
-HOURS_LOOKBACK = 2.5
-
 MARKET_SYMBOLS = [
     {"key": "brent", "name": "布伦特原油", "eastmoney_id": "112.B00Y", "unit": "美元/桶", "decimals": 2},
     {"key": "gold", "name": "伦敦金", "eastmoney_id": "101.GC00Y", "unit": "美元/盎司", "decimals": 1},
@@ -65,11 +63,11 @@ def google_news_url(query: str) -> str:
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-def fetch_rss(url: str, source_name: str, category: str) -> list[dict]:
+def fetch_rss(url: str, source_name: str, category: str, lookback_hours: float) -> list[dict]:
     try:
         feed = feedparser.parse(url)
         entries = []
-        cutoff = time.time() - HOURS_LOOKBACK * 3600
+        cutoff = time.time() - lookback_hours * 3600
         for e in feed.entries[:20]:
             published = None
             if hasattr(e, "published_parsed") and e.published_parsed:
@@ -115,18 +113,14 @@ def deduplicate(items: list[dict]) -> list[dict]:
 # ---------- FedWatch 概率卡片 ----------
 
 def fetch_fedwatch_card() -> tuple[str, str]:
-    """获取 CME FedWatch 利率预期，返回 (HTML卡片, 给AI的纯文本摘要)"""
     try:
-        # 1. 获取所有已知的未来 FOMC 会议概率数据
-        all_data = get_probabilities()  # 不传参数，返回所有未来会议
-        
+        all_data = get_probabilities()
         if not all_data or "meetings" not in all_data:
             return "", "（本时段未获取到 FedWatch 利率预期数据）"
 
         meetings = all_data["meetings"]
         today = datetime.datetime.now(datetime.timezone.utc).date()
 
-        # 2. 核心修复：从会议列表中，筛选出第一个日期 >= 今天的会议
         future_meetings = []
         for m in meetings:
             try:
@@ -136,11 +130,9 @@ def fetch_fedwatch_card() -> tuple[str, str]:
             except (ValueError, KeyError):
                 continue
         
-        # 如果所有会议都在过去，则无法给出预期
         if not future_meetings:
             return "", "（FedWatch 数据中暂无未来的 FOMC 会议）"
         
-        # 排序并取最近的一个未来会议
         future_meetings.sort(key=lambda x: x["date"])
         m = future_meetings[0]
         
@@ -149,7 +141,6 @@ def fetch_fedwatch_card() -> tuple[str, str]:
         current_target = all_data.get("current_target", "未知")
         trade_date = all_data.get("trade_date", "未知")
 
-        # 3. 整理为文本形式供 AI 研判
         prob_lines = []
         for rate_range, prob in probs.items():
             if prob > 0:
@@ -162,7 +153,6 @@ def fetch_fedwatch_card() -> tuple[str, str]:
             f"市场隐含概率分布为：{probs_text}。"
         )
 
-        # 4. 构建 HTML 卡片
         rows = []
         for rate_range, prob in probs.items():
             if prob <= 0:
@@ -349,7 +339,7 @@ def build_market_card(snapshot: list[dict]) -> str:
 
 # ---------- AI 简报 ----------
 
-def build_prompt(news_items: list[dict], hormuz_json: str, fedwatch_summary: str) -> str:
+def build_prompt(news_items: list[dict], hormuz_json: str, fedwatch_summary: str, is_morning_summary: bool) -> str:
     geo_items = [it for it in news_items if it["category"] == "geo"]
     fed_items = [it for it in news_items if it["category"] == "fed"]
     trump_items = [it for it in news_items if it["category"] == "trump"]
@@ -369,7 +359,10 @@ def build_prompt(news_items: list[dict], hormuz_json: str, fedwatch_summary: str
         for it in trump_items[:20]
     ) or "（本时段无新的特朗普公开言论或动态）"
 
+    morning_note = "**注意：这是早间汇总版，请把核心事实提炼得更全面一些，覆盖昨夜到今晨的重要变化。**" if is_morning_summary else ""
+
     return f"""你是一名专注于地缘政治、原油市场与美联储政策的投研助理。请基于以下过去数小时的信息，生成一份**简洁、可操作**的中文简报，并以微信可直接渲染的 HTML 片段输出，面向实盘投资者。
+{morning_note}
 
 ## 霍尔木兹海峡结构化状态
 {hormuz_json}
@@ -520,20 +513,37 @@ def build_fallback_html(items: list[dict], market_card: str, fedwatch_card: str)
 
 
 def main():
+    now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    current_hour = now.hour
+    
+    # 1. 夜间静默期（北京时间 0:00 - 7:59）
+    if 0 <= current_hour < 8:
+        print(f"[{get_beijing_time_now()}] 当前处于夜间静默期，跳过本次推送。")
+        return
+        
+    # 2. 设定动态抓取时间窗口
+    if 8 <= current_hour < 10:
+        lookback = 8.5  # 覆盖从昨晚 23:30 到今早 8:00 的新闻
+        is_morning_summary = True
+        print(f"[{get_beijing_time_now()}] 处于早间汇总模式，抓取过去 {lookback} 小时的新闻。")
+    else:
+        lookback = 2.5
+        is_morning_summary = False
+        print(f"[{get_beijing_time_now()}] 常规推送模式，抓取过去 {lookback} 小时的新闻。")
+
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = []
         for q in GEO_QUERIES:
-            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "geo"))
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "geo", lookback))
         for q in FED_QUERIES:
-            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "fed"))
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "fed", lookback))
         for q in TRUMP_QUERIES:
-            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "trump"))
+            futures.append(pool.submit(fetch_rss, google_news_url(q), f"GNews:{q}", "trump", lookback))
         
-        futures.append(pool.submit(fetch_rss, OILPRICE_RSS, "OilPrice", "geo"))
-        futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
-        futures.append(pool.submit(fetch_rss, TRUMP_RSS, "TruthSocial", "trump"))
+        futures.append(pool.submit(fetch_rss, OILPRICE_RSS, "OilPrice", "geo", lookback))
+        futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed", lookback))
+        futures.append(pool.submit(fetch_rss, TRUMP_RSS, "TruthSocial", "trump", lookback))
 
-        # 并行获取 FedWatch 数据
         fedwatch_future = pool.submit(fetch_fedwatch_card)
 
         all_items = []
@@ -541,8 +551,6 @@ def main():
             all_items.extend(fut.result())
 
     all_items = deduplicate(all_items)
-    
-    # 获取 FedWatch 结果
     fedwatch_card, fedwatch_summary = fedwatch_future.result()
 
     if not all_items:
@@ -550,11 +558,12 @@ def main():
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
         final_html = market_card + fedwatch_card
-        push_to_wechat(f"📊 行情与FedWatch速览 · {get_beijing_time_now()}", final_html)
+        push_title = f"☀️ 早间汇总（无新消息） · {get_beijing_time_now()}" if is_morning_summary else f"📊 行情与FedWatch速览 · {get_beijing_time_now()}"
+        push_to_wechat(push_title, final_html)
         return
 
     hormuz_json = fetch_hormuz_status()
-    prompt = build_prompt(all_items, hormuz_json, fedwatch_summary)
+    prompt = build_prompt(all_items, hormuz_json, fedwatch_summary, is_morning_summary)
 
     try:
         digest_html = call_deepseek(prompt)
@@ -562,16 +571,20 @@ def main():
         print(f"[DeepSeek 失败] {exc}")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        push_to_wechat("⚠️ 监控简报（AI 降级）", build_fallback_html(all_items, market_card, fedwatch_card))
+        fallback_title = "⚠️ 早间汇总（AI降级）" if is_morning_summary else "⚠️ 监控简报（AI降级）"
+        push_to_wechat(fallback_title, build_fallback_html(all_items, market_card, fedwatch_card))
         return
 
     snapshot = fetch_market_snapshot()
     market_card = build_market_card(snapshot)
 
-    # 组装最终推送，行情卡片在AI简报下方，FedWatch在最底部
     final_html = digest_html + market_card + fedwatch_card
     
-    title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
+    if is_morning_summary:
+        title = f"☀️ 地缘/原油/美联储早间汇总 · {get_beijing_time_now()}"
+    else:
+        title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
+        
     push_to_wechat(title, final_html)
     print("推送完成。")
 
