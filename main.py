@@ -9,6 +9,7 @@ import feedparser
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
+from cme_fedwatch import get_probabilities  # 导入 FedWatch 核心包
 
 # ==================== 配置区 ====================
 PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
@@ -109,6 +110,65 @@ def deduplicate(items: list[dict]) -> list[dict]:
             seen.add(h)
             out.append(it)
     return out
+
+
+# ---------- FedWatch 概率卡片 ----------
+
+def fetch_fedwatch_card() -> tuple[str, str]:
+    """获取 CME FedWatch 利率预期，返回 (HTML卡片, 给AI的纯文本摘要)"""
+    try:
+        # 默认获取下一次 FOMC 会议的利率概率分布
+        data = get_probabilities("next")
+        meetings = data.get("meetings", [])
+        if not meetings:
+            return "", "（本时段未获取到 FedWatch 利率预期数据）"
+
+        m = meetings[0]
+        meeting_date = m.get("date", "未知")
+        probs = m.get("probabilities", {})
+        current_target = data.get("current_target", "未知")
+
+        # 整理为文本形式供 AI 研判
+        prob_lines = []
+        for rate_range, prob in probs.items():
+            if prob > 0:
+                prob_lines.append(f"{rate_range}: {prob:.1f}%")
+        probs_text = "、".join(prob_lines)
+
+        ai_summary = (
+            f"下一次 FOMC 会议日期：{meeting_date}，当前基准利率区间：{current_target}。"
+            f"市场隐含概率分布为：{probs_text}。"
+        )
+
+        # 构建 HTML 卡片
+        rows = []
+        for rate_range, prob in probs.items():
+            if prob <= 0:
+                continue
+            # 概率大于50%的代表性概率显示为红色，其余为灰色
+            color = "#e74c3c" if prob >= 50 else "#888"
+            rows.append(
+                '<div style="display:inline-block;width:48%;vertical-align:top;margin-bottom:6px;">'
+                f'<span style="font-size:13px;color:#333;">{html.escape(rate_range)}</span>'
+                f'<span style="font-size:13px;font-weight:bold;color:{color};float:right;margin-right:4%;">{prob:.1f}%</span>'
+                "</div>"
+            )
+        cards_html = "".join(rows)
+
+        fedwatch_html = (
+            '<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;margin-bottom:12px;">'
+            '<div style="font-size:14px;font-weight:bold;color:#1a1a1a;'
+            'border-left:3px solid #9b59b6;padding-left:8px;margin-bottom:10px;">'
+            f"🎯 CME FedWatch · 下次会议 {meeting_date}"
+            "</div>"
+            f'<div style="font-size:12px;color:#666;margin-bottom:8px;">当前基准利率区间：{current_target}</div>'
+            f'<div style="background:#fff;border-radius:8px;padding:10px;">{cards_html}</div>'
+            "</div>"
+        )
+        return fedwatch_html, ai_summary
+    except Exception as exc:
+        print(f"[FedWatch 抓取失败] {exc}")
+        return "", "（本时段 FedWatch 数据接口异常）"
 
 
 # ---------- 行情快照 ----------
@@ -268,7 +328,7 @@ def build_market_card(snapshot: list[dict]) -> str:
 
 # ---------- AI 简报 ----------
 
-def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
+def build_prompt(news_items: list[dict], hormuz_json: str, fedwatch_summary: str) -> str:
     geo_items = [it for it in news_items if it["category"] == "geo"]
     fed_items = [it for it in news_items if it["category"] == "fed"]
     trump_items = [it for it in news_items if it["category"] == "trump"]
@@ -293,6 +353,9 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 ## 霍尔木兹海峡结构化状态
 {hormuz_json}
 
+## CME FedWatch 利率预期数据
+{fedwatch_summary}
+
 ## 地缘与原油新闻
 {geo_text}
 
@@ -316,7 +379,7 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 结合新闻措辞，给出对油价的偏多/偏空/中性倾向，不要给出具体点位。
 
 **美联储动态与政策信号（2~3 句）**
-聚焦利率路径、官员表态、流动性预期。若本时段无实质新信息，明确写“本时段无实质新信息”。
+聚焦利率路径、官员表态、流动性预期。**请务必结合上方提供的 CME FedWatch 概率数据**，解读市场对下次会议加降息幅度的真实定价，并说明其对美元及原油的间接影响。若本时段无实质新信息，明确写“本时段无实质新信息”。
 
 **特朗普动态（2~3 句）**
 总结特朗普在本时段内的关键表态或动作。如果涉及能源（如甲烷法规、伊朗行动）、关税或美联储施压，需重点点出其对原油或美元的可能影响。多条动作请独立成行。
@@ -363,7 +426,6 @@ def build_prompt(news_items: list[dict], hormuz_json: str) -> str:
 
 
 def auto_fix_html(html_str: str) -> str:
-    """强制补齐 AI 忘记闭合的 div 和 span 标签，防止嵌套吞噬后面的行情卡片"""
     open_div = html_str.count('<div')
     close_div = html_str.count('</div>')
     if open_div > close_div:
@@ -383,7 +445,7 @@ def call_deepseek(prompt: str) -> str:
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=2500,  # 🌟 防止输出被截断
+        max_tokens=2500,
     )
     content = resp.choices[0].message.content.strip()
     if content.startswith("```"):
@@ -393,14 +455,11 @@ def call_deepseek(prompt: str) -> str:
         content = content.strip()
     
     content = re.sub(r'\n+', '\n', content)
-    # 🌟 调用护甲：强行闭合缺失的标签
     content = auto_fix_html(content)
-    
     return content
 
 
 def push_to_wechat(title: str, html_content: str) -> None:
-    # 🌟 外层双保险
     safe_html = f'<div style="overflow-x:hidden; width:100%;">{html_content}</div>'
     r = requests.post(
         "https://www.pushplus.plus/send",
@@ -411,7 +470,7 @@ def push_to_wechat(title: str, html_content: str) -> None:
     print(f"[PushPlus] {r.json()}")
 
 
-def build_fallback_html(items: list[dict], market_card: str) -> str:
+def build_fallback_html(items: list[dict], market_card: str, fedwatch_card: str) -> str:
     rows = []
     for it in items[:20]:
         cat_map = {"geo": "地缘/原油", "fed": "美联储", "trump": "特朗普动态"}
@@ -430,8 +489,9 @@ def build_fallback_html(items: list[dict], market_card: str) -> str:
         '<div style="font-family:-apple-system,\'PingFang SC\',sans-serif;line-height:1.6;">'
         '<div style="background:#fff3cd;border-left:3px solid #f39c12;padding:10px 14px;'
         'border-radius:8px;margin-bottom:12px;font-size:13px;color:#856404;">'
-        "AI 研判暂不可用，以下为行情快照与原始新闻标题。"
+        "AI 研判暂不可用，以下为行情快照、FedWatch 与原始新闻标题。"
         "</div>"
+        f"{fedwatch_card}"
         f"{market_card}"
         f'<div style="background:#f7f8fa;border-radius:12px;padding:14px 16px;">{body}</div>'
         "</div>"
@@ -452,21 +512,28 @@ def main():
         futures.append(pool.submit(fetch_rss, FED_PRESS_RSS, "FedPress", "fed"))
         futures.append(pool.submit(fetch_rss, TRUMP_RSS, "TruthSocial", "trump"))
 
+        # 同时并行获取 FedWatch 数据
+        fedwatch_future = pool.submit(fetch_fedwatch_card)
+
         all_items = []
         for fut in as_completed(futures):
             all_items.extend(fut.result())
 
     all_items = deduplicate(all_items)
+    
+    # 获取 FedWatch 结果
+    fedwatch_card, fedwatch_summary = fedwatch_future.result()
 
     if not all_items:
-        print("过去数小时没有抓到新内容，仅推送行情快照。")
+        print("过去数小时没有抓到新内容，仅推送行情快照与FedWatch。")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        push_to_wechat(f"📊 行情速览 · {get_beijing_time_now()}", market_card)
+        final_html = fedwatch_card + market_card
+        push_to_wechat(f"📊 行情与FedWatch速览 · {get_beijing_time_now()}", final_html)
         return
 
     hormuz_json = fetch_hormuz_status()
-    prompt = build_prompt(all_items, hormuz_json)
+    prompt = build_prompt(all_items, hormuz_json, fedwatch_summary)
 
     try:
         digest_html = call_deepseek(prompt)
@@ -474,14 +541,14 @@ def main():
         print(f"[DeepSeek 失败] {exc}")
         snapshot = fetch_market_snapshot()
         market_card = build_market_card(snapshot)
-        push_to_wechat("⚠️ 监控简报（AI 降级）", build_fallback_html(all_items, market_card))
+        push_to_wechat("⚠️ 监控简报（AI 降级）", build_fallback_html(all_items, market_card, fedwatch_card))
         return
 
     snapshot = fetch_market_snapshot()
     market_card = build_market_card(snapshot)
 
-    # 由于 call_deepseek 里已经强制补齐了闭合标签，这里拼接绝对不会发生吞噬。
-    final_html = digest_html + market_card
+    # 组装最终推送，FedWatch 卡片放在最下方，行情卡片在它上方
+    final_html = digest_html + market_card + fedwatch_card
     
     title = f"🛢️ 地缘/原油/美联储简报 · {get_beijing_time_now()}"
     push_to_wechat(title, final_html)
